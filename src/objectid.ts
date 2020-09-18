@@ -1,6 +1,5 @@
 import { Buffer } from 'buffer';
-import { deprecate, inspect } from 'util';
-import { haveBuffer, randomBytes } from './parser/utils';
+import { deprecate, haveBuffer, randomBytes } from './parser/utils';
 
 // constants
 const PROCESS_UNIQUE = randomBytes(5);
@@ -422,6 +421,6 @@ Object.defineProperty(ObjectId, 'get_inc', {
  * @returns return the 24 character hex string representation.
  * @internal
  */
-Object.defineProperty(ObjectId.prototype, inspect.custom || 'inspect', ObjectId.prototype.toString);
+Object.defineProperty(ObjectId.prototype, 'inspect', ObjectId.prototype.toString);
 
 Object.defineProperty(ObjectId.prototype, '_bsontype', { value: 'ObjectID' });
