@@ -79,6 +79,424 @@ export interface DeserializeOptions {
   validation?: { utf8: boolean | Record<string, true> | Record<string, false> };
 }
 
+interface Shape {
+  parent: Shape | null;
+  children: Record<string, Shape>;
+  key: string;
+  type: number;
+  typeShape?: Shape;
+  useCount: number;
+  parser?: (buf: Uint8Array, index: number, size: number, target: Document | unknown[]) => [value: Document, index: number];
+};
+
+const headShape: Shape = makeHeadShape();
+
+function makeHeadShape(): Shape {
+  return {
+    parent: null,
+    children: Object.create(null),
+    key: '',
+    type: -1,
+    useCount: 0
+  };
+}
+
+function getHeadShape(shape: Shape | undefined): Shape | undefined {
+  return shape?.parent ? getHeadShape(shape.parent) : shape;
+}
+
+function lookupShape(head: Shape, type: number, name: string | number, options: DeserializeOptions): Shape {
+  const key = `${type}:${name}`;
+  const shape = (head.children[key] ??= {
+    parent: head,
+    children: Object.create(null),
+    key: `${name}`,
+    type: type,
+    useCount: 0
+  });
+  return increaseUseCount(shape, options);
+}
+
+declare global {
+  const process: { env: Record<string, string | undefined>; };
+  const console: any;
+}
+
+let FallbackError: unknown;
+let fallback: (msg: string) => string;
+let fallback$: (msg: string) => string;
+let isFallback: (expr: string) => string;
+let isFallbackFn: (arg: unknown) => boolean;
+if (process.env.ENABLE_BSON_SHAPE_PARSING === 'debug') {
+  FallbackError = class FallbackError extends Error {};
+  fallback = (msg) => `throw new FallbackError(${JSON.stringify(msg)})`;
+  fallback$ = (msg) => `throw new FallbackError(\`${msg}\`)`;
+  isFallback = (e: string) => `((${e}) instanceof FallbackError)`;
+} else {
+  FallbackError = new class FallbackError {};
+  fallback = () => 'throw FallbackError';
+  fallback$ = () => 'throw FallbackError';
+  isFallback = (e: string) => `(${e}) === FallbackError`;
+}
+isFallbackFn = eval(`(arg) => ${isFallback('arg')}`);
+
+const THRESHOLD = 1000 as const;
+
+function increaseUseCount(shape: Shape, options: DeserializeOptions): Shape {
+  shape.useCount++;
+
+  if (shape.useCount > THRESHOLD) {
+    compile(shape, options);
+  }
+  return shape;
+}
+
+function compile(shape: Shape, options: DeserializeOptions): void {
+  if (!process.env.ENABLE_BSON_SHAPE_PARSING) return;
+  if (shape.parser) return;
+  const promoteBuffers = options.promoteBuffers ?? false;
+  const promoteLongs = options.promoteLongs ?? true;
+  const promoteValues = options.promoteValues ?? true;
+  const useBigInt64 = options.useBigInt64 ?? false;
+
+  const headTypeShape = getHeadShape(shape.typeShape);
+  headTypeShape && compile(headTypeShape, options);
+  const bindings: Record<string, unknown> = { NumberUtils, ByteUtils, FallbackError, shape, headTypeShape };
+  let src = `(function (buffer, index, target) {
+  const originalIndex = index;`;
+  if (shape.type === -1) {
+    src += `
+    const size = NumberUtils.getInt32LE(buffer, index);
+    index += 4;`;
+  } else {
+    src += `
+    if (buffer[index] !== ${shape.type}) {
+      ${fallback$(`mismatched type, wanted ${shape.type} but got \${buffer[index]}`)};
+    }
+    index++;
+    `;
+  }
+
+  if (shape.type !== -1) {
+    const keyAsUtf8 = new Uint8Array(ByteUtils.utf8ByteLength(shape.key));
+    ByteUtils.encodeUTF8Into(keyAsUtf8, shape.key, 0);
+    for (const byte of keyAsUtf8) {
+      src += `if (buffer[index++] !== ${byte}) ${fallback('mismatched key byte')};\n`;
+    }
+    src += `if (buffer[index++] !== 0) ${fallback('mismatched key terminator')};\n`;
+  }
+  src += `let value; {\n`;
+  switch (shape.type) {
+    case -1:
+      // This is a special case for the head shape
+      src += `value = target = {};`;
+      break;
+    case constants.BSON_DATA_BINARY:
+      bindings.Binary = Binary;
+      bindings.UUID = UUID;
+      src += `
+      let binarySize = NumberUtils.getInt32LE(buffer, index);
+      index += 4;
+      const totalBinarySize = binarySize;
+      const subType = buffer[index++];
+      if (binarySize < 0) ${fallback('negative binary type element size found')};
+
+      // Is the length longer than the document
+      if (binarySize > buffer.byteLength)
+        ${fallback('document length exceeded')};
+
+      // If we have subtype 2 skip the 4 bytes for the size
+      if (subType === Binary.SUBTYPE_BYTE_ARRAY) {
+        binarySize = NumberUtils.getInt32LE(buffer, index);
+        index += 4;
+        if (binarySize < 0)
+          ${fallback('negative binary type element size found')};
+        if (binarySize > totalBinarySize - 4)
+          ${fallback('document length exceeded')};
+        if (binarySize < totalBinarySize - 4)
+          ${fallback('document length exceeded')};
+      }
+
+      if (${promoteBuffers} && ${promoteValues}) {
+        value = ByteUtils.toLocalBufferType(buffer.subarray(index, index + binarySize));
+      } else {
+        value = new Binary(buffer.subarray(index, index + binarySize), subType);
+        if (subType === ${constants.BSON_BINARY_SUBTYPE_UUID_NEW} && UUID.isValid(value)) {
+          value = value.toUUID();
+        }
+      }
+
+      // Update the index
+      index = index + binarySize;
+      `;
+      break;
+    case constants.BSON_DATA_BOOLEAN:
+      src += `
+      if (buffer[index] !== 0 && buffer[index] !== 1)
+        ${fallback('illegal boolean type value')};
+      value = buffer[index++] === 1;`;
+      break;
+    case constants.BSON_DATA_DATE:
+      bindings.Long = Long;
+      src += `
+      const lowBits = NumberUtils.getInt32LE(buffer, index);
+      const highBits = NumberUtils.getInt32LE(buffer, index + 4);
+      index += 8;
+
+      value = new Date(new Long(lowBits, highBits).toNumber());`;
+      break;
+    case constants.BSON_DATA_INT:
+      src += `
+      value = ${promoteValues === false ? 'new Int32' : ''}(NumberUtils.getInt32LE(buffer, index));
+      index += 4;`;
+      break;
+    case constants.BSON_DATA_LONG:
+      bindings.Long = Long;
+      if (useBigInt64) {
+        src += `
+        value = NumberUtils.getBigInt64LE(buffer, index);
+        index += 8;`;
+      } else {
+        src += `
+        // Unpack the low and high bits
+        const lowBits = NumberUtils.getInt32LE(buffer, index);
+        const highBits = NumberUtils.getInt32LE(buffer, index + 4);
+        index += 8;
+
+        const long = new Long(lowBits, highBits);
+        // Promote the long if possible
+        if (${promoteLongs && promoteValues === true}) {
+          value =
+            long.lessThanOrEqual(JS_INT_MAX_LONG) && long.greaterThanOrEqual(JS_INT_MIN_LONG)
+              ? long.toNumber()
+              : long;
+        } else {
+          value = long;
+        }`;
+      }
+      break;
+    case constants.BSON_DATA_NUMBER:
+      src += `
+      value = ${promoteValues === false ? 'new Double' : ''}(NumberUtils.getFloat64LE(buffer, index));
+      index += 8;`;
+      break;
+    case constants.BSON_DATA_MAX_KEY:
+      bindings.MaxKey = MaxKey;
+      src += `value = new MaxKey();`;
+      break;
+    case constants.BSON_DATA_MIN_KEY:
+      bindings.MinKey = MinKey;
+      src += `value = new MinKey();`;
+      break;
+    case constants.BSON_DATA_NULL:
+      src += `value = null;`;
+      break;
+    case constants.BSON_DATA_OID:
+      bindings.ObjectId = ObjectId;
+      src += `
+      const oid = ByteUtils.allocateUnsafe(12);
+      for (let i = 0; i < 12; i++) oid[i] = buffer[index + i];
+      value = new ObjectId(oid);
+      index = index + 12;`;
+      break;
+    case constants.BSON_DATA_REGEXP:
+      bindings.BSONRegExp = BSONRegExp;
+      src += `
+      // Get the start search index
+      i = index;
+      // Locate the end of the c string
+      while (buffer[i] !== 0x00 && i < buffer.length) {
+        i++;
+      }
+      // If are at the end of the buffer there is a problem with the document
+      if (i >= buffer.length) ${fallback('document length exceeded')};
+      // Return the C string
+      const source = ByteUtils.toUTF8(buffer, index, i, false);
+      // Create the regexp
+      index = i + 1;
+
+      // Get the start search index
+      i = index;
+      // Locate the end of the c string
+      while (buffer[i] !== 0x00 && i < buffer.length) {
+        i++;
+      }
+      // If are at the end of the buffer there is a problem with the document
+      if (i >= buffer.length) ${fallback('document length exceeded')};
+      // Return the C string
+      const regExpOptions = ByteUtils.toUTF8(buffer, index, i, false);
+      index = i + 1;
+
+      // For each option add the corresponding one for javascript
+      const optionsArray = new Array(regExpOptions.length);
+
+      // Parse options
+      for (i = 0; i < regExpOptions.length; i++) {
+        switch (regExpOptions[i]) {
+          case 'm':
+            optionsArray[i] = 'm';
+            break;
+          case 's':
+            optionsArray[i] = 'g';
+            break;
+          case 'i':
+            optionsArray[i] = 'i';
+            break;
+        }
+      }
+
+      value = new BSONRegExp(source, optionsArray.join(''));`;
+      break;
+    case constants.BSON_DATA_STRING:
+      src += `
+      const stringSize = NumberUtils.getInt32LE(buffer, index);
+      index += 4;
+      if (
+        stringSize <= 0 ||
+        stringSize > buffer.length - index ||
+        buffer[index + stringSize - 1] !== 0
+      ) {
+        ${fallback('document length exceeded')};
+      }
+      value = ByteUtils.toUTF8(buffer, index, index + stringSize - 1, false);
+      index += stringSize;`;
+      break;
+    case constants.BSON_DATA_TIMESTAMP:
+      bindings.Timestamp = Timestamp;
+      src += `
+      value = new Timestamp({
+        i: NumberUtils.getUint32LE(buffer, index),
+        t: NumberUtils.getUint32LE(buffer, index + 4)
+      });
+      index += 8;`;
+      break;
+    case constants.BSON_DATA_SYMBOL:
+      bindings.BSONSymbol = BSONSymbol;
+      src += `
+      const stringSize = NumberUtils.getInt32LE(buffer, index);
+      index += 4;
+      if (
+        stringSize <= 0 ||
+        stringSize > buffer.length - index ||
+        buffer[index + stringSize - 1] !== 0
+      ) {
+        ${fallback('document length exceeded')};
+      }
+      const symbol = ByteUtils.toUTF8(buffer, index, index + stringSize - 1, shouldValidateKey);
+      value = ${promoteValues ? 'symbol' : 'new BSONSymbol(symbol)'};
+      index += stringSize;`;
+      break;
+    case constants.BSON_DATA_DECIMAL128:
+      bindings.Decimal128 = Decimal128;
+      src += `
+      // Buffer to contain the decimal bytes
+      const bytes = ByteUtils.allocateUnsafe(16);
+      // Copy the next 16 bytes into the bytes buffer
+      for (let i = 0; i < 16; i++) bytes[i] = buffer[index + i];
+      // Update index
+      index = index + 16;
+      // Assign the new Decimal128 value
+      value = new Decimal128(bytes);`;
+      break;
+    case constants.BSON_DATA_CODE:
+      src += `
+      const stringSize = NumberUtils.getInt32LE(buffer, index);
+      index += 4;
+      if (
+        stringSize <= 0 ||
+        stringSize > buffer.length - index ||
+        buffer[index + stringSize - 1] !== 0
+      ) {
+        ${fallback('document length exceeded')};
+      }
+      const functionString = ByteUtils.toUTF8(
+        buffer,
+        index,
+        index + stringSize - 1,
+        shouldValidateKey
+      );
+
+      value = new Code(functionString);
+
+      // Update parse index position
+      index = index + stringSize;`;
+      break;
+      // deprecated below
+    case constants.BSON_DATA_CODE_W_SCOPE:
+    case constants.BSON_DATA_DBPOINTER:
+    case constants.BSON_DATA_UNDEFINED:
+      console.log('deprecated type, not compiling', shape.type, shape.key);
+      return;
+    case constants.BSON_DATA_OBJECT:
+      if (!shape.typeShape) return;
+      bindings.deserializeObject = deserializeObject;
+      src += `
+      value = deserializeObject(buffer, index, ${JSON.stringify(options)}, false, headTypeShape)[0];
+      index += NumberUtils.getInt32LE(buffer, index);
+      `;
+      break;
+    case constants.BSON_DATA_ARRAY:
+      if (!shape.typeShape) return;
+      bindings.deserializeObject = deserializeObject;
+      src += `
+      value = deserializeObject(buffer, index, ${JSON.stringify(options)}, true, headTypeShape)[0];
+      index += NumberUtils.getInt32LE(buffer, index);
+      `;
+      break;
+    default:
+      throw new BSONError(`Unsupported type ${shape.type} for key ${shape.key}`);
+  }
+  src += `}`;
+  if (shape.type !== -1) {
+    src += `
+    target[${JSON.stringify(shape.key)}] = value;
+    `;
+  }
+  src += `
+  if (buffer[index] === 0) return target;
+  `;
+
+  const totalChildren = Object.values(shape.children).reduce((acc, s) => acc + s.useCount, 0);
+  let orderedChildren = Object.entries(shape.children).sort((a, b) => {
+    return b[1].useCount - a[1].useCount;
+  }).map(([key, value], i) => [key, i, value] as const);
+  let accountedChildUsage = 0;
+
+  while (accountedChildUsage < totalChildren * 0.99 || (totalChildren - accountedChildUsage) > 0.9 * THRESHOLD) {
+    const [, i, child] = orderedChildren.shift()!;
+    accountedChildUsage += child.useCount;
+    if (!child.parser) {
+      compile(child, options);
+      if (!child.parser) return;
+    }
+    bindings[`p_${i}`] = child.parser;
+    src += `
+    try {
+      // parse ${child.type} ${child.key}
+      index = p_${i}(buffer, index, target)[1];
+      shape.useCount++;
+      return [target, index];
+    } catch (e) {
+      if (!${isFallback('e')}) throw e;
+    }
+    `;
+  }
+
+  src += `
+  if (buffer[index] !== 0) {
+    ${fallback$('document did not terminate in 0 byte, found \${buffer[index]}')};
+  }
+  if (index + 1 !== originalIndex + size) {
+    ${fallback('document length mismatched')};
+  }
+
+  shape.useCount++;
+  return [target, index + 1];
+  })`;
+  src = `(function parse(` + Object.keys(bindings).join(',') + `) { return (${src}); })`;
+  shape.parser = eval(src)(...Object.values(bindings));
+}
+
 // Internal long versions
 const JS_INT_MAX_LONG = Long.fromNumber(constants.JS_INT_MAX);
 const JS_INT_MIN_LONG = Long.fromNumber(constants.JS_INT_MIN);
@@ -119,7 +537,8 @@ export function internalDeserialize(
   }
 
   // Start deserialization
-  return deserializeObject(buffer, index, options, isArray);
+  const [ value, ] = deserializeObject(buffer, index, options, isArray ?? false, headShape);
+  return value;
 }
 
 const allowedDBRefKeys = /^\$ref$|^\$id$|^\$db$/;
@@ -128,8 +547,9 @@ function deserializeObject(
   buffer: Uint8Array,
   index: number,
   options: DeserializeOptions,
-  isArray = false
-) {
+  isArray: boolean,
+  shape: Shape
+): [value: Document, shape: Shape] {
   const fieldsAsRaw = options['fieldsAsRaw'] == null ? null : options['fieldsAsRaw'];
 
   // Return raw bson buffer instead of parsing it
@@ -199,6 +619,16 @@ function deserializeObject(
   // Validate that we have at least 4 bytes of buffer
   if (buffer.length < 5) throw new BSONError('corrupt bson message < 5 bytes long');
 
+  increaseUseCount(shape, options);
+  if (shape.parser && process.env.ENABLE_BSON_SHAPE_PARSING) {
+    try {
+      return [shape.parser(buffer, index, buffer.byteLength, isArray ? [] : {})[0], shape];
+    } catch (e) {
+      console.log({e, shape, buffer, index, p: shape.parser.toString()});
+      if (isFallbackFn(e)) throw e;
+    }
+  }
+
   // Read the document size
   const size = NumberUtils.getInt32LE(buffer, index);
   index += 4;
@@ -234,6 +664,11 @@ function deserializeObject(
 
     // Represents the key
     const name = isArray ? arrayIndex++ : ByteUtils.toUTF8(buffer, index, i, false);
+
+    const newShape = lookupShape(shape, elementType, name, options);
+    if (!isArray) {
+      shape = newShape;
+    }
 
     // shouldValidateKey is true if the key should be validated, false otherwise
     let shouldValidateKey = true;
@@ -294,6 +729,8 @@ function deserializeObject(
       if (objectSize <= 0 || objectSize > buffer.length - index)
         throw new BSONError('bad embedded document length in bson');
 
+      let innerShape: Shape | undefined;
+
       // We have a raw value
       if (raw) {
         value = buffer.subarray(index, index + objectSize);
@@ -302,10 +739,12 @@ function deserializeObject(
         if (!globalUTFValidation) {
           objectOptions = { ...options, validation: { utf8: shouldValidateKey } };
         }
-        value = deserializeObject(buffer, _index, objectOptions, false);
+        const headShape = getHeadShape(shape.typeShape) ?? makeHeadShape();
+        [value, innerShape] = deserializeObject(buffer, _index, objectOptions, false, increaseUseCount(headShape, options));
       }
 
       index = index + objectSize;
+      shape.typeShape = innerShape;
     } else if (elementType === constants.BSON_DATA_ARRAY) {
       const _index = index;
       const objectSize = NumberUtils.getInt32LE(buffer, index);
@@ -322,8 +761,12 @@ function deserializeObject(
       if (!globalUTFValidation) {
         arrayOptions = { ...arrayOptions, validation: { utf8: shouldValidateKey } };
       }
-      value = deserializeObject(buffer, _index, arrayOptions, true);
+
+      let innerShape: Shape | undefined = undefined;
+      const headShape = getHeadShape(shape.typeShape) ?? makeHeadShape();
+      [value, innerShape] = deserializeObject(buffer, _index, arrayOptions, true, increaseUseCount(headShape, options));
       index = index + objectSize;
+      shape.typeShape = innerShape;
 
       if (buffer[index - 1] !== 0) throw new BSONError('invalid array terminator byte');
       if (index !== stopIndex) throw new BSONError('corrupted array bson');
@@ -548,7 +991,7 @@ function deserializeObject(
       // Decode the size of the object document
       const objectSize = NumberUtils.getInt32LE(buffer, index);
       // Decode the scope object
-      const scopeObject = deserializeObject(buffer, _index, options, false);
+      const scopeObject = deserializeObject(buffer, _index, options, false, headShape);
       // Adjust the index
       index = index + objectSize;
 
@@ -613,15 +1056,13 @@ function deserializeObject(
   }
 
   // if we did not find "$ref", "$id", "$db", or found an extraneous $key, don't make a DBRef
-  if (!isPossibleDBRef) return object;
-
-  if (isDBRefLike(object)) {
+  if (isPossibleDBRef && isDBRefLike(object)) {
     const copy = Object.assign({}, object) as Partial<DBRefLike>;
     delete copy.$ref;
     delete copy.$id;
     delete copy.$db;
-    return new DBRef(object.$ref, object.$id, object.$db, copy);
+    return [new DBRef(object.$ref, object.$id, object.$db, copy), shape];
   }
 
-  return object;
+  return [object, shape];
 }
